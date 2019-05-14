@@ -7,9 +7,7 @@ import urllib2 as urlrequest
 import calendar
 import datetime
 import json
-import name_mapping
 import re
-import pickle
 import time
 from random import randint
 
@@ -24,6 +22,13 @@ class integration(object):
     ENDPOINT_MAP = {'event': [EVENTS_V1],
                 'alert': [ALERTS_V1],
                 'all': [EVENTS_V1, ALERTS_V1]}
+
+    JSON_field_mappings = {
+        'source' : 'username',
+        'source_info_ip' : 'ip_src',
+        'created_at' : 'timestamp',
+        'name' : 'message'
+    }
 
     CEF_MAPPING = {
         # This is used for mapping CEF header prefix and extension to json returned by server
@@ -45,41 +50,19 @@ class integration(object):
         "location": "dhost",
     }
 
-    CEF_FORMAT = ('CEF:%(version)s|%(device_vendor)s|%(device_product)s|'
-              '%(device_version)s|%(device_event_class_id)s|%(name)s|%(severity)s|')
-
     
-    MISSING_VALUE = 'NA'
-    PREFIX_PATTERN = re.compile(r'([|\\])')
-    EXTENSION_PATTERN = re.compile(r'([=\\])')
-
-    SEVERITY_MAP = {'none': 0,
-                'low': 1,
-                'medium': 5,
-                'high': 8,
-                'very_high': 10}
-
-
-
     def sophos_main(self):
-    
-        # Read config file
-        
-        self.ds.log('DEBUG', "Config loaded, retrieving results for '%s'" % self.ds.config_get('sophos', 'api-key'))
-        self.ds.log('DEBUG', "Config retrieving results for '%s'" % self.ds.config_get('sophos', 'authorization'))
     
         tuple_endpoint = self.ENDPOINT_MAP['all']
     
-        state_dir = os.path.join(self.ds.config_get('sophos', 'app_path'), 'state')
-    
-        self.create_state_dir(state_dir)
+        self.state_dir = os.path.join(self.ds.config_get('sophos', 'app_path'), 'state')
     
         handler = urlrequest.HTTPSHandler()
         opener = urlrequest.build_opener(handler)
     
         endpoint_config = {'format': 'cef',
                            'filename': 'stdout',
-                           'state_dir': state_dir,
+                           'state_dir': self.state_dir,
                            'since': False}
     
         for endpoint in tuple_endpoint:
@@ -95,48 +78,19 @@ class integration(object):
         self.ds.log('DEBUG', "Config state_file='%s' and cwd='%s'" % (state_file_path, os.getcwd()))
         cursor = False
         since = False
-        if endpoint_config['since']:  # Run since supplied datetime
-            since = endpoint_config['since']
-        else:
-            try:  # Run since last run (retrieve from state_file)
-                with open(state_file_path, 'rb') as f:
-                    cursor = pickle.load(f)
-            except IOError:  # Default to current time
-                since = int(calendar.timegm(((datetime.datetime.utcnow() - datetime.timedelta(hours=12)).timetuple())))
-                self.ds.log('INFO', "No datetime found, defaulting to last 12 hours for results")
+        cursor = self.ds.get_state(self.state_dir)
+        if cursor == None:
+            since = int(calendar.timegm(((datetime.datetime.utcnow() - datetime.timedelta(hours=12)).timetuple())))
+            self.ds.log('INFO', "No datetime found, defaulting to last 12 hours for results")
     
         if since is not False:
             self.ds.log('DEBUG', '%s - Retrieving results since: %s' %(endpoint, since))
         else:
             self.ds.log('DEBUG', '%s - Retrieving results starting cursor: %s' %(endpoint, cursor))
     
-        results = self.call_endpoint(opener, endpoint, since, cursor, state_file_path)
-    
-        #write_json_format(results, siem_logger)
-        self.write_cef_format(results)
-    
-    
-    def write_json_format(self, results, siem_logger):
-        for i in results:
-            i = remove_null_values(i)
-            update_cef_keys(i)
-            name_mapping.update_fields(log, i)
-            line = ds_stdout(i)
-            siem_logger.info(json.dumps(line, ensure_ascii=False))
-    
-    def write_cef_format(self, results):
-        for i in results:
-            i = self.remove_null_values(i)
-            name_mapping.update_fields(self.ds.logger, i)
-            self.ds.writeEvent(self.format_cef(self.flatten_json(i)).encode('ascii', 'ignore'))
-    
-    def create_state_dir(self, state_dir):
-        if not os.path.exists(state_dir):
-            try:
-                os.makedirs(state_dir)
-            except OSError as e:
-                log("Failed to create %s, %s" % (state_dir, str(e)))
-                sys.exit(1)
+        event_list = self.call_endpoint(opener, endpoint, since, cursor, state_file_path)
+        for line in event_list:
+            self.ds.writeJSONEvent(line, JSON_field_mappings = self.JSON_field_mappings)
     
     def call_endpoint(self, opener, endpoint, since, cursor, state_file_path):
         default_headers = {'Content-Type': 'application/json; charset=utf-8',
@@ -153,7 +107,9 @@ class integration(object):
         else:
             params['cursor'] = cursor
             self.jitter()
-    
+
+        event_list = []
+
         while True:
             args = '&'.join(['%s=%s' % (k, v) for k, v in params.items()])
             events_request_url = '%s%s?%s' % (self.ds.config_get('sophos', 'url'), endpoint, args)
@@ -174,44 +130,16 @@ class integration(object):
             # u'event_counts': {u'Event::Endpoint::Compliant': 679,
             # u'events': {}
             # }
+            event_list +=  events['items']
             for e in events['items']:
-                yield e
-    
-            self.store_state(events['next_cursor'], state_file_path)
+                event_list.append(e)
+            self.ds.set_state(self.state_dir, events['next_cursor']) 
             if not events['has_more']:
                 break
             else:
                 params['cursor'] = events['next_cursor']
                 params.pop('from_date', None)
-    
-    
-    def store_state(self, next_cursor, state_file_path):
-        # Store cursor
-        #log("Next run will retrieve results using cursor %s\n" % next_cursor)
-        with open(state_file_path, 'wb') as f:
-            pickle.dump(next_cursor, f, protocol=2)
-    
-    
-    # Flattening JSON objects in Python
-    # https://medium.com/@amirziai/flattening-json-objects-in-python-f5343c794b10#.37u7axqta
-    def flatten_json(self, y):
-        out = {}
-    
-        def flatten(x, name=''):
-            if type(x) is dict:
-                for a in x:
-                    flatten(x[a], name + a + '_')
-            else:
-                out[name[:-1]] = x
-    
-        flatten(y)
-        return out
-    
-    
-    def log(self, s):
-        if not QUIET:
-            sys.stderr.write('%s\n' % s)
-    
+        return event_list 
     
     def jitter(self):
         time.sleep(randint(0, 10))
@@ -229,94 +157,6 @@ class integration(object):
                 log('Error during request. Error code: %s, Error message: %s' % (e.code, e.read()))
                 raise
             return response.read()
-    
-    def format_prefix(self, data):
-        # pipe and backslash in header must be escaped
-        # escape group with backslash
-        return self.PREFIX_PATTERN.sub(r'\\\1', data)
-    
-    def format_extension(self, data):
-        # equal sign and backslash in extension value must be escaped
-        # escape group with backslash
-        if type(data) is str:
-            return self.EXTENSION_PATTERN.sub(r'\\\1', data)
-        else:
-            return data
-    
-    def map_severity(self, severity):
-        if severity in self.SEVERITY_MAP:
-            return self.SEVERITY_MAP[severity]
-        else:
-            msg = 'The "%s" severity can not be mapped, defaulting to 0' % severity
-            log(msg)
-            return self.SEVERITY_MAP['none']
-    
-    def extract_prefix_fields(self, data):
-        # extract prefix fields and remove those from data dictionary
-        name_field = self.CEF_MAPPING['name']
-        device_event_class_id_field = self.CEF_MAPPING['device_event_class_id']
-        severity_field = self.CEF_MAPPING['severity']
-    
-        name = data.get(name_field, self.MISSING_VALUE)
-        name = self.format_prefix(name)
-        data.pop(name_field, None)
-    
-        device_event_class_id = data.get(device_event_class_id_field, self.MISSING_VALUE)
-        device_event_class_id = self.format_prefix(device_event_class_id).replace('::', '-')
-        data.pop(device_event_class_id_field, None)
-    
-        severity = data.get(severity_field, self.MISSING_VALUE)
-        severity = self.map_severity(severity)
-        data.pop(severity_field, None)
-    
-        fields = {'name': name,
-                  'device_event_class_id': device_event_class_id,
-                  'severity': severity,
-                  'version': self.ds.config_get('cef', 'VERSION'),
-                  'device_vendor': self.ds.config_get('cef', 'VENDOR'),
-                  'device_version': self.ds.config_get('cef', 'VERSION'),
-                  'device_product': self.ds.config_get('cef', 'PRODUCT')}
-        return fields
-
-    
-    def update_cef_keys(self, data):
-        # Replace if there is a mapped CEF key
-        for key, value in list(data.items()):
-            new_key = self.CEF_MAPPING.get(key, key)
-            if new_key == key:
-                continue
-            data[new_key] = value
-            del data[key]
-    
-    
-    def format_cef(self, data):
-        fields = self.extract_prefix_fields(data)
-        msg = self.CEF_FORMAT % fields
-
-        self.update_cef_keys(data)
-
-        msg += "rt=%s" %data['rt']
-        data.pop('rt', None)
-
-        #msg += " duid=%s" %data['duid']
-        #data.pop('duid', None)
-
-        #msg += " suser=%s" %data['suser'].replace('\\', '\\\\')
-        msg += " suser=%s" %data['suser']
-        data.pop('suser', None)
-
-        msg += " dhost=%s" %data['dhost']
-        data.pop('dhost', None)
-
-        msg += " msg="
-    
-        for index, (key, value) in enumerate(data.items()):
-            value = self.format_extension(value)
-            if index > 0:
-                msg += ' %s\=%s' % (key, value)
-            else:
-                msg += '%s\=%s' % (key, value)
-        return msg
     
     
     def remove_null_values(self, data):

@@ -1,17 +1,16 @@
 # conf file must be in same directory as script
 
-[cef]
-VENDOR = Sophos
-PRODUCT = EventLogs
-VERSION = 1.0
-SEVERITY = 5
-CEF_VERSION = CEF:0
+[json]
+app_name = Sophos EventLogs
+version = 1.0
 
 [sophos]
-
 url = https://api5.central.sophos.com/gateway
+
 api-key = APIKEY
-authorization = AUTHSTRING
 
 # Auth String starts with "Basic " then has the string.  The "Basic" must be included
+authorization = AUTHSTRING
+
+app_path = /usr/local/sophosEventLogs
 
