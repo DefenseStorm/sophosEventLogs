@@ -28,4 +28,4 @@ git clone --recurse-submodules https://github.com/DefenseStorm/sophosEventLogs.g
 3. Add the following entry to the root crontab so the script will run every
    5 minutes
 
-   */5 * * * * /usr/local/sophosEventLogs/sophosEventLogs.py
+   */5 * * * * cd /usr/local/sophosEventLogs; ./sophosEventLogs.py
